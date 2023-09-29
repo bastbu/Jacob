@@ -5,85 +5,99 @@
 namespace Jacob.Tests;
 
 using FsCheck;
-using System;
+using FsCheck.Xunit;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
+using Xunit;
 
-interface ISerializableObject<T> where T : ISerializableObject<T>, IEquatable<T>
+interface ISerializableObject
 {
-    string Serialize(object value);
-    static abstract IJsonReader<T> GetDeserializer();
+    string Serialize();
+    IJsonReader<object> GetDeserializer();
+    object Value { get; }
 }
 
-sealed class JsonString : ISerializableObject<JsonString>, IEquatable<JsonString>
+sealed class JsonString : ISerializableObject
 {
-    string Value { get; }
+    public object Value { get; }
 
     public JsonString(string value) => Value = value;
 
-    public override bool Equals(object? obj) => Equals(obj as JsonString);
-    public bool Equals(JsonString? other) => Value.Equals(other?.Value, StringComparison.Ordinal);
-    public override int GetHashCode() => HashCode.Combine(Value);
+    public string Serialize() => JsonSerializer.Serialize(Value);
+    public IJsonReader<object> GetDeserializer() => from s in JsonReader.String()
+                                                    select (object)s;
 
-
-    public string Serialize(object value) => JsonSerializer.Serialize(value);
-    public static IJsonReader<JsonString> GetDeserializer() => from s in JsonReader.String()
-                                                               select new JsonString(s);
+    public static implicit operator JsonString(string value) => new(value);
 }
 
-sealed class JsonNumber : ISerializableObject<JsonNumber>, IEquatable<JsonNumber>
+sealed class JsonNumber : ISerializableObject
 {
-    int Value { get; }
+    public object Value { get; }
 
     public JsonNumber(int value) => Value = value;
 
-    public override bool Equals(object? obj) => Equals(obj as JsonNumber);
-    public bool Equals(JsonNumber? other) => Value.Equals(other?.Value);
-    public override int GetHashCode() => HashCode.Combine(Value);
 
-
-    public string Serialize(object value) => JsonSerializer.Serialize(value);
-    public static IJsonReader<JsonNumber> GetDeserializer() => from i in JsonReader.Int32()
-                                                               select new JsonNumber(i);
+    public string Serialize() => JsonSerializer.Serialize(Value);
+    public IJsonReader<object> GetDeserializer() => from i in JsonReader.Int32()
+                                                    select (object)i;
+    public static implicit operator JsonNumber(int value) => new(value);
 }
 
-sealed class JsonArray<T> : ISerializableObject<JsonArray<T>>, IEquatable<JsonArray<T>>
-    where T : ISerializableObject<T>, IEquatable<T>
+sealed class JsonArray : ISerializableObject
 {
-    IReadOnlyCollection<T> Value { get; }
+    readonly IReadOnlyCollection<ISerializableObject> value;
 
-    public JsonArray(IReadOnlyCollection<T> value) => Value = value;
+    public object Value => this.value.Select(v => v.Value).ToList();
 
-    public override bool Equals(object? obj) => Equals(obj as JsonArray<T>);
-    public bool Equals(JsonArray<T>? other) => other is { } someOther && Value.SequenceEqual(someOther.Value);
-    public override int GetHashCode() => HashCode.Combine(Value);
+    public JsonArray(IReadOnlyCollection<ISerializableObject> value) => this.value = value;
 
-
-    public string Serialize(object value) => JsonSerializer.Serialize(value);
-    public static IJsonReader<JsonArray<T>> GetDeserializer() => JsonReader.Array(T.GetDeserializer(), arr => new JsonArray<T>(arr));
+    public string Serialize() => JsonSerializer.Serialize(Value);
+    public IJsonReader<object> GetDeserializer() =>
+        JsonReader.Array(this.value.FirstOrDefault()?.GetDeserializer() ?? (from i in JsonReader.Int32() select (object)i),
+                         arr => (object)arr);
 }
 
 public sealed class FsCheckTests
 {
-    private Gen<ISerializableObject<object>> generator;
+    readonly Gen<ISerializableObject> generator;
 
     public FsCheckTests()
     {
-        var primitiveGenerator = Gen.OneOf<ISerializableObject<object>>(new[]
+        var primitiveGenerator = Gen.OneOf(new Gen<ISerializableObject>[]
         {
             from s in Arb.Generate<string>()
-            select (ISerializableObject<object>)new JsonString(s),
+            select (ISerializableObject)new JsonString(s),
             from i in Arb.Generate<int>()
-            select (ISerializableObject<object>)new JsonNumber(i)
+            select (ISerializableObject)new JsonNumber(i)
         });
 
         var recursiveGenerator =
-            from r in Gen.OneOf<object>(new[]
-            {
-                Arb.Generate<>
-            });
+            from len in Gen.Choose(0, 10)
+            from l in Gen.ListOf(primitiveGenerator)
+            select (ISerializableObject)new JsonArray(l);
 
-        this.generator = Gen.OneOf<ISerializableObject<object>>(primitiveGenerator, recursiveGenerator);
+        this.generator = Gen.OneOf(primitiveGenerator, recursiveGenerator);
     }
+
+    [Fact]
+    public void Tests()
+    {
+        Prop.ForAll(Arb.From(this.generator), arb =>
+        {
+            var deserializer = arb.GetDeserializer();
+            var serialized = arb.Serialize();
+            var deserialized = deserializer.Read(serialized);
+            var serialized2 = JsonSerializer.Serialize(deserialized);
+            return serialized.Equals(serialized2, System.StringComparison.Ordinal);
+        }).VerboseCheckThrowOnFailure();
+    }
+
+    [Property]
+    public Property Success() => Prop.ForAll(Arb.From(this.generator), arb =>
+    {
+        var deserializer = arb.GetDeserializer();
+        var equals = deserializer.Read(arb.Serialize()) == arb;
+        return equals;
+    });
 }
